@@ -29,7 +29,8 @@ namespace optimize {
  * @param[in] random_seed random seed for the random number generator
  * @param[in] chain chain id to advance the pseudo random number generator
  * @param[in] init_radius radius to initialize
- * @param[in] init_alpha line search step size for first iteration
+ * @param[in] init_alpha line search step size for first iteration, reduced
+ *   if needed so that the first trial step moves no parameter by more than 1
  * @param[in] tol_obj convergence tolerance on absolute changes in
  *   objective function value
  * @param[in] tol_rel_obj convergence tolerance on relative changes
@@ -61,9 +62,12 @@ int bfgs(Model& model, const stan::io::var_context& init,
 
   std::vector<int> disc_vector;
   std::vector<double> cont_vector;
+  double init_lp = 0;
+  std::vector<double> init_grad;
   try {
-    cont_vector = util::initialize<false>(model, init, rng, init_radius, false,
-                                          logger, init_writer);
+    cont_vector
+        = util::initialize<false>(model, init, rng, init_radius, false, logger,
+                                  init_writer, 100, &init_lp, &init_grad);
   } catch (const std::exception& e) {
     logger.error(e.what());
     return error_codes::CONFIG;
@@ -73,8 +77,15 @@ int bfgs(Model& model, const stan::io::var_context& init,
       Model, stan::optimization::BFGSUpdate_HInv<>, double, Eigen::Dynamic,
       jacobian>
       Optimizer;
-  Optimizer bfgs(model, cont_vector, disc_vector, &bfgs_ss);
+  Optimizer bfgs(model, disc_vector, &bfgs_ss);
+  if constexpr (jacobian) {
+    // the initial gradient was computed without the Jacobian
+    bfgs.initialize(cont_vector);
+  } else {
+    bfgs.initialize(cont_vector, init_lp, init_grad);
+  }
   bfgs._ls_opts.alpha0 = init_alpha;
+  bfgs._ls_opts.maxStep0 = 1;
   bfgs._conv_opts.tolAbsF = tol_obj;
   bfgs._conv_opts.tolRelF = tol_rel_obj;
   bfgs._conv_opts.tolAbsGrad = tol_grad;

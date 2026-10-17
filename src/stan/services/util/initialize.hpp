@@ -60,6 +60,11 @@ namespace util {
  * @param[in,out] init_writer init writer (on the unconstrained scale)
  * @param[in] max_tries The maximum number of times a random initialization
  *   will be re-tried to achieve a finite log density and gradient. Default 100.
+ * @param[out] log_prob_out if not null, receives the log density (dropping
+ *   constants, as computed by log_prob_grad<true, Jacobian>) at the returned
+ *   parameters
+ * @param[out] gradient_out if not null, receives the gradient of the log
+ *   density at the returned parameters
  * @throws exception passed through from the model if the model has a
  *   fatal error (not a std::domain_error)
  * @throws std::domain_error if the model can not be initialized and
@@ -73,7 +78,9 @@ std::vector<double> initialize(Model& model, const InitContext& init, RNG& rng,
                                double init_radius, bool print_timing,
                                stan::callbacks::logger& logger,
                                stan::callbacks::writer& init_writer,
-                               int max_tries = 100) {
+                               int max_tries = 100,
+                               double* log_prob_out = nullptr,
+                               std::vector<double>* gradient_out = nullptr) {
   std::vector<double> unconstrained;
   std::vector<int> disc_vector;
 
@@ -215,6 +222,12 @@ std::vector<double> initialize(Model& model, const InitContext& init, RNG& rng,
     }
     if (gradient_ok) {
       init_writer(unconstrained);
+      if (log_prob_out) {
+        *log_prob_out = log_prob;
+      }
+      if (gradient_out) {
+        *gradient_out = std::move(gradient);
+      }
       return unconstrained;
     }
   }

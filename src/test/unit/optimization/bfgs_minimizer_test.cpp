@@ -2,7 +2,11 @@
 #include <stan/optimization/bfgs.hpp>
 #include <stan/io/empty_var_context.hpp>
 #include <test/test-models/good/optimization/rosenbrock.hpp>
+#include <limits>
 #include <sstream>
+#include <stdexcept>
+#include <string>
+#include <vector>
 
 typedef rosenbrock_model_namespace::rosenbrock_model Model;
 typedef stan::optimization::BFGSMinimizer<
@@ -348,4 +352,176 @@ TEST_F(OptimizationBfgsMinimizer, minimize) {
   Optimizer bfgs(_adaptor);
 
   EXPECT_FLOAT_EQ(bfgs.minimize(cont_vector), 31);
+}
+
+TEST_F(OptimizationBfgsMinimizer, initialize_from_value_and_gradient) {
+  stan::io::empty_var_context dummy_context;
+  Model rb_model(dummy_context);
+  std::stringstream out;
+  stan::optimization::ModelAdaptor<Model> adaptor(rb_model, disc_vector, &out);
+  Optimizer evaluated(adaptor), given(adaptor);
+  evaluated.initialize(cont_vector);
+  given.initialize(cont_vector, evaluated.curr_f(), evaluated.curr_g());
+  EXPECT_EQ(evaluated.curr_x(), given.curr_x());
+  EXPECT_EQ(evaluated.curr_f(), given.curr_f());
+  EXPECT_EQ(evaluated.curr_g(), given.curr_g());
+  EXPECT_EQ(evaluated.curr_p(), given.curr_p());
+  EXPECT_EQ(0, given.iter_num());
+
+  Eigen::VectorXd g = evaluated.curr_g();
+  g[0] = std::numeric_limits<double>::infinity();
+  EXPECT_THROW(given.initialize(cont_vector, evaluated.curr_f(), g),
+               std::runtime_error);
+  EXPECT_THROW(
+      given.initialize(cont_vector, std::numeric_limits<double>::quiet_NaN(),
+                       evaluated.curr_g()),
+      std::runtime_error);
+}
+
+TEST_F(OptimizationBfgsMinimizer, model_adaptor_matches_log_prob_grad) {
+  stan::io::empty_var_context dummy_context;
+  Model rb_model(dummy_context);
+  std::stringstream out;
+  stan::optimization::ModelAdaptor<Model> adaptor(rb_model, disc_vector, &out);
+  for (const auto &xy : {std::make_pair(-1.0, 1.0), std::make_pair(0.5, 2.0),
+                         std::make_pair(3.0, -2.0)}) {
+    Eigen::VectorXd x(2), g;
+    x << xy.first, xy.second;
+    double f;
+    EXPECT_EQ(0, adaptor(x, f, g));
+    std::vector<double> params_r{xy.first, xy.second}, grad;
+    double lp = stan::model::log_prob_grad<true, false>(rb_model, params_r,
+                                                        disc_vector, grad);
+    EXPECT_EQ(-lp, f);
+    ASSERT_EQ(2, g.size());
+    EXPECT_EQ(-grad[0], g[0]);
+    EXPECT_EQ(-grad[1], g[1]);
+    EXPECT_EQ(0, stan::math::ChainableStack::instance_->var_stack_.size());
+  }
+  EXPECT_EQ(3, adaptor.fevals());
+}
+
+namespace bfgs_minimizer_test {
+// log density x + 10 (with the Jacobian) + 100 (unless propto); mode 1 throws
+// std::domain_error, mode 2 std::runtime_error, mode 3 has an infinite
+// gradient at 0, mode 4 an infinite value
+struct mock_model {
+  int mode = 0;
+  size_t num_params_r() const { return 1; }
+  template <bool propto, bool jacobian, typename T>
+  T log_prob(std::vector<T> &x, std::vector<int> &params_i,
+             std::ostream *msgs) const {
+    if (mode == 1) {
+      throw std::domain_error("mock domain error");
+    } else if (mode == 2) {
+      throw std::runtime_error("mock fatal error");
+    } else if (mode == 3) {
+      return stan::math::cbrt(x[0]);
+    } else if (mode == 4) {
+      return x[0] + std::numeric_limits<double>::infinity();
+    }
+    return x[0] + (jacobian ? 10.0 : 0.0) + (propto ? 0.0 : 100.0);
+  }
+};
+}  // namespace bfgs_minimizer_test
+
+TEST(OptimizationModelAdaptor, template_arguments_and_errors) {
+  using bfgs_minimizer_test::mock_model;
+  mock_model model;
+  std::vector<int> params_i;
+  std::stringstream msgs;
+  stan::optimization::ModelAdaptor<mock_model, false> adaptor(model, params_i,
+                                                              &msgs);
+  stan::optimization::ModelAdaptor<mock_model, true> adaptor_jacobian(
+      model, params_i, &msgs);
+  const auto &stack = stan::math::ChainableStack::instance_->var_stack_;
+  Eigen::VectorXd x(1), g;
+  x << 0.5;
+  double f = 0;
+  EXPECT_EQ(0, adaptor(x, f, g));  // propto = true, no Jacobian
+  EXPECT_EQ(-0.5, f);
+  ASSERT_EQ(1, g.size());
+  EXPECT_EQ(-1.0, g[0]);
+  EXPECT_EQ(0, adaptor_jacobian(x, f, g));
+  EXPECT_EQ(-10.5, f);
+  EXPECT_EQ(0, stack.size());
+
+  model.mode = 1;  // a failed evaluation
+  EXPECT_EQ(1, adaptor(x, f, g));
+  EXPECT_NE(std::string::npos, msgs.str().find("mock domain error"));
+  EXPECT_EQ(0, stack.size());
+  model.mode = 2;  // other errors propagate
+  EXPECT_THROW(adaptor(x, f, g), std::runtime_error);
+  EXPECT_EQ(0, stack.size());
+  x << 0.0;
+  model.mode = 3;
+  EXPECT_EQ(3, adaptor(x, f, g));
+  EXPECT_EQ(0, stack.size());
+  model.mode = 4;
+  EXPECT_EQ(2, adaptor(x, f, g));
+  EXPECT_EQ(0, stack.size());
+}
+
+// f(x) = sum cosh(x_i), minimised at 0; the evaluation fails where cosh
+// overflows
+struct minimizer_cosh {
+  int operator()(const Eigen::VectorXd &x, double &f, Eigen::VectorXd &g) {
+    f = x.array().cosh().sum();
+    g = x.array().sinh().matrix();
+    return std::isfinite(f) && g.allFinite() ? 0 : 1;
+  }
+};
+
+TEST(OptimizationBfgsMinimizerCosh, large_initial_gradient) {
+  // At x0 = (30, 30) the gradient is sinh(30) = 5.3e12 per coordinate. With
+  // the default maxStep0 = +inf the first trial step is init_alpha * |g| =
+  // 5.3e9, where cosh overflows, and after halving that step 10 times the
+  // first line search fails. With maxStep0 = 1 (as the optimize services set
+  // it) the first trial moves no coordinate by more than 1.
+  stan::optimization::BFGSMinimizer<minimizer_cosh,
+                                    stan::optimization::LBFGSUpdate<> >
+      lbfgs(minimizer_cosh{});
+  lbfgs._ls_opts.maxStep0 = 1;
+  Eigen::VectorXd x0(2);
+  x0 << 30, 30;
+  lbfgs.initialize(x0);
+  int ret = lbfgs.step();
+  EXPECT_EQ(stan::optimization::TERM_SUCCESS, ret);
+  while (ret == stan::optimization::TERM_SUCCESS) {
+    ret = lbfgs.step();
+  }
+  EXPECT_GT(ret, 0);
+  EXPECT_NEAR(2, lbfgs.curr_f(), 1e-8);
+}
+
+// f(x) = exp(30 x) - 30 x, minimised at 0
+struct minimizer_exp {
+  int operator()(const Eigen::VectorXd &x, double &f, Eigen::VectorXd &g) {
+    f = std::exp(30 * x[0]) - 30 * x[0];
+    g.resize(1);
+    g[0] = 30 * (std::exp(30 * x[0]) - 1);
+    return std::isfinite(f) && g.allFinite() ? 0 : 1;
+  }
+};
+
+TEST(OptimizationBfgsMinimizerExp, no_relative_convergence_after_reset) {
+  // From x0 = 2 (gradient 3e27) the first line search fails with the default
+  // maxStep0 = +inf. With the first trial step capped at 1 it accepts x = 1,
+  // where the gradient is 3e14 and the inverse Hessian estimate from that one
+  // step is 3e-28. The relative gradient test (with CmdStan's default
+  // tolerance) must not stop the run there.
+  stan::optimization::BFGSMinimizer<minimizer_exp,
+                                    stan::optimization::LBFGSUpdate<> >
+      lbfgs(minimizer_exp{});
+  lbfgs._ls_opts.maxStep0 = 1;
+  lbfgs._conv_opts.tolRelGrad = 1e7;
+  Eigen::VectorXd x0(1);
+  x0 << 2;
+  lbfgs.initialize(x0);
+  int ret = stan::optimization::TERM_SUCCESS;
+  while (ret == stan::optimization::TERM_SUCCESS) {
+    ret = lbfgs.step();
+  }
+  EXPECT_GT(ret, 0);
+  EXPECT_NEAR(1, lbfgs.curr_f(), 1e-8);
 }

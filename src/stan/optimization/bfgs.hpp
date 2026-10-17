@@ -48,6 +48,10 @@ class LSOptions {
   Scalar minAlpha{1e-12};
   Scalar maxLSIts{20};
   Scalar maxLSRestarts{10};
+  // largest change of any parameter in the first trial step of the first
+  // iteration and after a Hessian reset (the step is alpha0 times the
+  // gradient, or shorter)
+  Scalar maxStep0{std::numeric_limits<Scalar>::infinity()};
 };
 template <typename FunctorType, typename QNUpdateType, typename Scalar = double,
           int DimAtCompile = Eigen::Dynamic>
@@ -58,7 +62,7 @@ class BFGSMinimizer {
 
  protected:
   FunctorType _func;
-  VectorT _gk, _gk_1, _xk_1, _xk, _pk, _pk_1;
+  VectorT _gk, _gk_1, _xk_1, _xk, _pk, _pk_1, _sk, _yk;
   Scalar _fk, _fk_1, _alphak_1;
   Scalar _alpha, _alpha0;
   size_t _itNum;
@@ -162,9 +166,35 @@ class BFGSMinimizer {
     _note = "";
   }
 
+  /**
+   * Initialize the minimizer at x0 from the objective value and gradient
+   * at x0, which the caller has already computed, so that the objective is
+   * not evaluated again.
+   *
+   * @tparam Vec type of the initial point
+   * @tparam GradVec type of the gradient
+   * @param x0 initial point
+   * @param f0 objective value at x0
+   * @param g0 gradient of the objective at x0
+   * @throw std::runtime_error if f0 or g0 is not finite
+   */
+  template <typename Vec, typename GradVec, require_vector_t<Vec> * = nullptr,
+            require_vector_t<GradVec> * = nullptr>
+  void initialize(Vec &&x0, Scalar f0, GradVec &&g0) {
+    _xk = Eigen::Map<const Eigen::VectorXd>(x0.data(), x0.size());
+    _gk = Eigen::Map<const Eigen::VectorXd>(g0.data(), g0.size());
+    _fk = f0;
+    if (!std::isfinite(_fk) || !_gk.allFinite()) {
+      throw std::runtime_error("Error evaluating initial BFGS point.");
+    }
+    _pk = -_gk;
+
+    _itNum = 0;
+    _note = "";
+  }
+
   int step() {
     Scalar gradNorm, stepNorm;
-    VectorT sk, yk;
     int retCode(0);
     int resetB(0);
 
@@ -192,8 +222,11 @@ class BFGSMinimizer {
                      * CubicInterp(_gk_1.dot(_pk_1), _alphak_1, _fk - _fk_1,
                                    _gk.dot(_pk_1), _ls_opts.minAlpha, 1.0));
       } else {
-        // On the first step (or, after a reset) use the default step size
-        _alpha0 = _alpha = _ls_opts.alpha0;
+        // On the first step (or, after a reset) use the default step size,
+        // but move no parameter by more than maxStep0 along the gradient
+        _alpha0 = _alpha = std::min(
+            _ls_opts.alpha0,
+            _ls_opts.maxStep0 / _pk.template lpNorm<Eigen::Infinity>());
       }
 
       // Perform the line search.  If successful, the results are in the
@@ -226,21 +259,21 @@ class BFGSMinimizer {
     _gk.swap(_gk_1);
     _pk.swap(_pk_1);
 
-    sk.noalias() = _xk - _xk_1;
-    yk.noalias() = _gk - _gk_1;
+    _sk.noalias() = _xk - _xk_1;
+    _yk.noalias() = _gk - _gk_1;
 
     gradNorm = _gk.norm();
-    stepNorm = sk.norm();
+    stepNorm = _sk.norm();
 
     // Update QN approximation
     if (resetB) {
       // If the QN approximation was reset, automatically scale it
       // and update the step-size accordingly
-      Scalar B0fact = _qn.update(yk, sk, true);
+      Scalar B0fact = _qn.update(_yk, _sk, true);
       _pk_1 /= B0fact;
       _alphak_1 = _alpha * B0fact;
     } else {
-      _qn.update(yk, sk);
+      _qn.update(_yk, _sk);
       _alphak_1 = _alpha;
     }
     // Compute search direction for next step
@@ -256,6 +289,10 @@ class BFGSMinimizer {
       retCode = TERM_ABSX;  // Change in x was too small
     } else if (_itNum >= _conv_opts.maxIts) {
       retCode = TERM_MAXIT;  // Max number of iterations hit
+    } else if (resetB && _alpha0 < _ls_opts.alpha0) {
+      // The first trial step was cut short by maxStep0: the relative tests
+      // would judge convergence from that short step alone
+      retCode = TERM_SUCCESS;
     } else if (rel_obj_decrease()
                < _conv_opts.tolRelF * std::numeric_limits<Scalar>::epsilon()) {
       // Relative improvement in objective function wasn't sufficient
@@ -288,7 +325,8 @@ class ModelAdaptor {
   M &_model;
   std::vector<int> _params_i;
   std::ostream *_msgs;
-  std::vector<double> _x, _g;
+  std::vector<double> _x;
+  std::vector<stan::math::var> _ad;
   size_t _fevals;
 
  public:
@@ -296,6 +334,10 @@ class ModelAdaptor {
       : _model(model), _params_i(params_i), _msgs(msgs), _fevals(0) {}
 
   size_t fevals() const { return _fevals; }
+  /**
+   * Count a gradient evaluation that was made outside this adaptor.
+   */
+  void count_eval() { _fevals++; }
   int operator()(const Eigen::Matrix<double, Eigen::Dynamic, 1> &x, double &f) {
     using Eigen::Dynamic;
     using Eigen::Matrix;
@@ -327,38 +369,41 @@ class ModelAdaptor {
   }
   int operator()(const Eigen::Matrix<double, Eigen::Dynamic, 1> &x, double &f,
                  Eigen::Matrix<double, Eigen::Dynamic, 1> &g) {
-    using Eigen::Dynamic;
-    using Eigen::Matrix;
-    using stan::math::index_type;
-    using stan::model::log_prob_grad;
-    typedef typename index_type<Matrix<double, Dynamic, 1> >::type idx_t;
-
-    _x.resize(x.size());
-    for (idx_t i = 0; i < x.size(); i++)
-      _x[i] = x[i];
-
     _fevals++;
 
+    // stan::model::log_prob_grad<true, jacobian>, without allocating or
+    // copying the parameters and the gradient
+    _ad.resize(x.size());
+    for (Eigen::Index i = 0; i < x.size(); ++i) {
+      _ad[i] = stan::math::var(x.coeff(i));
+    }
     try {
-      f = -log_prob_grad<true, jacobian>(_model, _x, _params_i, _g, _msgs);
+      stan::math::var lp
+          = _model.template log_prob<true, jacobian>(_ad, _params_i, _msgs);
+      f = -lp.val();
+      lp.grad();
     } catch (const std::domain_error &e) {
+      stan::math::recover_memory();
       if (_msgs)
         (*_msgs) << e.what() << std::endl;
       return 1;
+    } catch (...) {
+      stan::math::recover_memory();
+      throw;
     }
-
-    g.resize(_g.size());
-    for (size_t i = 0; i < _g.size(); i++) {
-      if (!std::isfinite(_g[i])) {
-        if (_msgs)
-          *_msgs << "Error evaluating model log probability: "
-                    "Non-finite gradient."
-                 << std::endl;
-        return 3;
-      }
-      g[i] = -_g[i];
+    g.resize(x.size());
+    for (Eigen::Index i = 0; i < x.size(); ++i) {
+      g.coeffRef(i) = -_ad[i].adj();
     }
+    stan::math::recover_memory();
 
+    if (!g.allFinite()) {
+      if (_msgs)
+        *_msgs << "Error evaluating model log probability: "
+                  "Non-finite gradient."
+               << std::endl;
+      return 3;
+    }
     if (std::isfinite(f)) {
       return 0;
     } else {
@@ -407,9 +452,39 @@ class BFGSLineSearch
     BFGSBase::initialize(params_r);
   }
 
+  /**
+   * Construct the optimizer without evaluating the model; call
+   * initialize() before step().
+   *
+   * @param model model to optimize
+   * @param params_i integer parameters of the model
+   * @param msgs stream for messages from the model
+   */
+  BFGSLineSearch(M &model, const std::vector<int> &params_i,
+                 std::ostream *msgs = 0)
+      : BFGSBase(ModelAdaptor<M, jacobian>(model, params_i, msgs)) {}
+
   template <typename Vec, require_vector_t<Vec> * = nullptr>
   void initialize(Vec &&params_r) {
     BFGSBase::initialize(params_r);
+  }
+
+  /**
+   * Initialize at params_r from the log density and its gradient there, as
+   * computed by stan::model::log_prob_grad<true, jacobian>, without
+   * evaluating the model again. This counts as one gradient evaluation.
+   *
+   * @tparam Vec type of the parameters
+   * @param params_r unconstrained parameters
+   * @param lp log density at params_r
+   * @param grad gradient of the log density at params_r
+   * @throw std::runtime_error if lp or grad is not finite
+   */
+  template <typename Vec, require_vector_t<Vec> * = nullptr>
+  void initialize(Vec &&params_r, double lp, const std::vector<double> &grad) {
+    vector_t g = -Eigen::Map<const vector_t>(grad.data(), grad.size());
+    BFGSBase::initialize(params_r, -lp, g);
+    this->_func.count_eval();
   }
 
   size_t grad_evals() { return this->_func.fevals(); }

@@ -351,7 +351,7 @@ TEST_F(OptimizationBfgsMinimizer, minimize) {
   EXPECT_EQ("", out.str());
   Optimizer bfgs(_adaptor);
 
-  EXPECT_FLOAT_EQ(bfgs.minimize(cont_vector), 31);
+  EXPECT_FLOAT_EQ(bfgs.minimize(cont_vector), 20);
 }
 
 TEST_F(OptimizationBfgsMinimizer, initialize_from_value_and_gradient) {
@@ -524,4 +524,35 @@ TEST(OptimizationBfgsMinimizerExp, no_relative_convergence_after_reset) {
   }
   EXPECT_GT(ret, 0);
   EXPECT_NEAR(1, lbfgs.curr_f(), 1e-8);
+}
+
+// f(x) = sum_i exp(i x_i) - i x_i, i = 1, ..., n, minimised at 0 with f = n
+struct minimizer_exp_sum {
+  int operator()(const Eigen::VectorXd &x, double &f, Eigen::VectorXd &g) {
+    Eigen::ArrayXd c = Eigen::ArrayXd::LinSpaced(x.size(), 1, x.size());
+    Eigen::ArrayXd e = (c * x.array()).exp();
+    f = (e - c * x.array()).sum();
+    g = (c * (e - 1)).matrix();
+    return std::isfinite(f) && g.allFinite() ? 0 : 1;
+  }
+};
+
+TEST(OptimizationBfgsMinimizerExpSum, dense_bfgs_large_initial_curvature) {
+  // From x0 = (5, ..., 5) the curvature falls from 25 e^25 = 1.8e12 to at
+  // most 25 at the optimum. The dense inverse Hessian estimate used to keep
+  // the scale of the first steps in the directions not explored since, and
+  // with CmdStan's default tolerances the relative gradient test stopped the
+  // run at f - 5 = 7.6e3.
+  stan::optimization::BFGSMinimizer<minimizer_exp_sum,
+                                    stan::optimization::BFGSUpdate_HInv<> >
+      bfgs(minimizer_exp_sum{});
+  bfgs._conv_opts.tolRelGrad = 1e7;
+  Eigen::VectorXd x0 = Eigen::VectorXd::Constant(5, 5);
+  bfgs.initialize(x0);
+  int ret = stan::optimization::TERM_SUCCESS;
+  while (ret == stan::optimization::TERM_SUCCESS) {
+    ret = bfgs.step();
+  }
+  EXPECT_GT(ret, 0);
+  EXPECT_NEAR(5, bfgs.curr_f(), 1e-6);
 }
